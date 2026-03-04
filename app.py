@@ -1,7 +1,7 @@
 # app.py — Streamlit Cloud–friendly Italian speaking app (English UI)
 # - Uses streamlit-mic-recorder (with graceful fallback to upload)
 # - faster-whisper (tiny, CPU, int8) for reliability on Streamlit Cloud
-# - LanguageTool grammar/style analysis (public API by default)
+# - LanguageTool grammar/style analysis tuned for speech (writing nits suppressed)
 # - WAV-only to avoid extra media dependencies
 # - Lightweight text metrics (WPM, TTR, avg sentence length)
 # - Optional TTS (gTTS) to hear the corrected version
@@ -37,6 +37,7 @@ from gtts import gTTS
 # You can override via Streamlit "Secrets" or environment variable.
 DEFAULT_LT_ENDPOINT = os.getenv("LT_ENDPOINT", "https://api.languagetool.org/v2/check")
 
+# Cloud-safe defaults
 ASR_MODEL_NAME = "tiny"   # Force tiny for Streamlit Cloud
 ASR_COMPUTE = "int8"      # Fastest CPU compute type
 
@@ -95,28 +96,71 @@ def get_wav_duration(path: str) -> float:
         rate = wf.getframerate() or 16000
         return frames / float(rate)
 
+# ---- PATCHED: Transcribe with improved decoding/VAD for tiny ----
 def transcribe(model: WhisperModel, wav_path: str) -> str:
-    """Transcribe Italian speech using faster-whisper."""
+    """
+    Transcribe Italian speech using faster-whisper with settings tuned to
+    squeeze better accuracy out of the 'tiny' model on learner speech.
+
+    Key tweaks:
+      - beam_size=5, best_of=5 for better sequence selection
+      - temperature=0.0 for deterministic decoding (fewer hallucinations)
+      - condition_on_previous_text=False to avoid error carryover
+      - initial_prompt in Italian to bias toward standard Italian output
+      - VAD with slightly shorter silence to segment learner speech
+    """
     segments, _ = model.transcribe(
         wav_path,
         language="it",
+        task="transcribe",
         vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 700},
-        beam_size=1  # speed-focused; increase for accuracy if desired
+        vad_parameters={"min_silence_duration_ms": 600},
+        beam_size=5,
+        best_of=5,
+        temperature=0.0,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+        no_speech_threshold=0.6,
+        initial_prompt=(
+            "Trascrivi in italiano standard senza riformulare. "
+            "Evita correzioni di maiuscole non necessarie. "
+            "Non tradurre, mantieni la lingua italiana."
+        ),
+        condition_on_previous_text=False
     )
     return " ".join(s.text.strip() for s in segments if s.text).strip()
 
+# ---- PATCHED: LanguageTool call focused on speech grammar/style ----
 def call_languagetool(text: str, endpoint: str) -> Dict:
-    """Call LanguageTool endpoint and return JSON."""
-    r = requests.post(endpoint, data={"text": text, "language": "it"}, timeout=30)
+    """
+    Call LanguageTool but suppress 'writing' categories (typos, casing, punctuation).
+    This keeps feedback focused on speech grammar/morphosyntax and style.
+    """
+    payload = {
+        "text": text,
+        "language": "it",
+        # Suppress writing-only categories
+        "disabledCategories": "TYPOS,CASING,PUNCTUATION",
+        # If you still see noisy rules, list them here:
+        # "disabledRules": "UPPERCASE_SENTENCE_START,COMMA_PARENTHESIS_WHITESPACE",
+    }
+    r = requests.post(endpoint, data=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
 def parse_lt_matches(data: Dict) -> List[LTMatch]:
+    """
+    Parse LT matches AND defensively filter out writing-only categories that
+    might still slip through (double safety).
+    """
     out: List[LTMatch] = []
     for m in data.get("matches", []):
-        reps = [r.get("value") for r in m.get("replacements", [])]
         rule = m.get("rule") or {}
+        cat  = (rule.get("category") or {}).get("id", "")
+        # Filter writing-only categories at UI layer as well
+        if cat in {"TYPOS", "CASING", "PUNCTUATION"}:
+            continue
+        reps = [r.get("value") for r in m.get("replacements", [])]
         out.append(
             LTMatch(
                 message=m.get("message", ""),
@@ -125,7 +169,7 @@ def parse_lt_matches(data: Dict) -> List[LTMatch]:
                 replacements=reps,
                 rule_id=rule.get("id", ""),
                 sentence=m.get("sentence", ""),
-                category=(rule.get("category") or {}).get("id", "")
+                category=cat
             )
         )
     return out
@@ -265,7 +309,7 @@ with col1:
             st.warning("No text to analyze.")
             st.stop()
 
-        # Grammar & style
+        # Grammar & style (speech-focused)
         with st.spinner("Analyzing grammar…"):
             try:
                 lt_json = call_languagetool(text, lt_endpoint)
@@ -274,37 +318,12 @@ with col1:
                 st.error(f"LanguageTool error: {e}")
                 matches = []
 
-        st.markdown("### ✍️ Issues & suggestions")
+        st.markdown("### ✍️ Issues & suggestions (speech-focused)")
         if not matches:
-            st.info("No significant issues found (or API limit reached).")
+            st.info("No significant grammar/style issues found (or API limit reached).")
         else:
             for i, m in enumerate(matches, 1):
                 suggestion = m.replacements[0] if m.replacements else "—"
                 with st.expander(f"#{i} {m.message}"):
                     st.write(f"**Sentence:** {m.sentence}")
-                    st.write(f"**Suggestion:** `{suggestion}`")
-                    st.write(f"Rule: `{m.rule_id}` • Category: `{m.category}`")
-
-        # Corrected
-        corrected = apply_corrections(text, matches)
-        st.markdown("### ✅ Corrected version (auto-generated)")
-        st.write(corrected)
-
-        # TTS
-        if auto_tts and corrected.strip():
-            try:
-                audio = tts_bytes(corrected)
-                st.audio(audio, format="audio/mp3")
-                st.download_button("⬇️ Download audio (MP3)", data=audio, file_name="correction.mp3", mime="audio/mpeg")
-            except Exception as e:
-                st.warning(f"TTS unavailable: {e}")
-
-        # Metrics
-        metrics = compute_text_metrics(text)
-        wpm = round(metrics["n_words"] / (duration / 60), 1) if duration > 0 else 0
-
-        st.markdown("### 📊 Indicators")
-        cA, cB, cC = st.columns(3)
-        cA.metric("Words", metrics["n_words"])
-        cA.metric("Sentences", metrics["n_sentences"])
-        cB.metric("TTR (lexical diversity)", metrics["ttr"])
+                    st.write(f"**Suggestion:** `{screenshot_safe(suggestion)}`")
