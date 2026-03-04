@@ -1,5 +1,5 @@
 streamlit==1.31.0
-streamlit-mic-recorder==0.3.1
+streamlit-mic-recorder==0.0.8
 faster-whisper==1.0.3
 numpy
 requests
