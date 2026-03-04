@@ -1,5 +1,5 @@
 # app.py — Streamlit Cloud–friendly Italian speaking app (English UI)
-# - Uses st-audio-recorder (works on Streamlit Cloud)
+# - Uses streamlit-mic-recorder (works on Streamlit Cloud)
 # - faster-whisper (tiny, int8)
 # - LanguageTool grammar/style
 # - WAV-only for simplicity
@@ -12,11 +12,11 @@ import json
 import wave
 import tempfile
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import streamlit as st
-from st_audio_recorder import st_audiorecorder
+from streamlit_mic_recorder import mic_recorder
 from faster_whisper import WhisperModel
 import requests
 from gtts import gTTS
@@ -26,9 +26,8 @@ from gtts import gTTS
 # ---------------------------
 
 DEFAULT_LT_ENDPOINT = os.getenv("LT_ENDPOINT", "https://api.languagetool.org/v2/check")
-
-ASR_MODEL_NAME = "tiny"
-ASR_COMPUTE = "int8"
+ASR_MODEL_NAME = "tiny"   # force tiny for Streamlit Cloud
+ASR_COMPUTE = "int8"      # fastest CPU compute type
 
 PROMPTS = [
     "Describe your ideal day from start to finish.",
@@ -68,9 +67,11 @@ class LTMatch:
 
 @st.cache_resource(show_spinner=False)
 def load_fw_model() -> WhisperModel:
+    """Load faster-whisper (cached)."""
     return WhisperModel(ASR_MODEL_NAME, device="cpu", compute_type=ASR_COMPUTE)
 
 def save_wav_bytes_to_file(wav_bytes: bytes) -> Tuple[str, float]:
+    """Save WAV bytes to a temp file and return path + duration (seconds)."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     with open(tmp.name, "wb") as f:
         f.write(wav_bytes)
@@ -78,7 +79,9 @@ def save_wav_bytes_to_file(wav_bytes: bytes) -> Tuple[str, float]:
 
 def get_wav_duration(path: str) -> float:
     with wave.open(path, "rb") as wf:
-        return wf.getnframes() / float(wf.getframerate())
+        frames = wf.getnframes()
+        rate = wf.getframerate() or 16000
+        return frames / float(rate)
 
 def transcribe(model: WhisperModel, wav_path: str) -> str:
     segments, _ = model.transcribe(
@@ -96,7 +99,7 @@ def call_languagetool(text: str, endpoint: str) -> Dict:
     return r.json()
 
 def parse_lt_matches(data: Dict) -> List[LTMatch]:
-    out = []
+    out: List[LTMatch] = []
     for m in data.get("matches", []):
         reps = [r.get("value") for r in m.get("replacements", [])]
         rule = m.get("rule") or {}
@@ -118,7 +121,8 @@ def apply_corrections(text: str, matches: List[LTMatch]) -> str:
     for m in sorted(matches, key=lambda x: x.offset, reverse=True):
         if m.replacements and m.length > 0:
             s, e = m.offset, m.offset + m.length
-            out = out[:s] + m.replacements[0] + out[e:]
+            if 0 <= s <= len(out) and 0 <= e <= len(out):
+                out = out[:s] + m.replacements[0] + out[e:]
     return out
 
 def compute_text_metrics(text: str) -> Dict[str, float]:
@@ -154,27 +158,54 @@ def tts_bytes(text: str) -> io.BytesIO:
 # ------------ UI -----------
 # ---------------------------
 
+st.set_page_config(page_title="Italian Speaking Practice (Cloud)", page_icon="🇮🇹", layout="wide")
 st.title("🇮🇹 Italian Speaking Practice — Cloud Edition (tiny ASR model)")
 
 with st.sidebar:
     st.header("Settings")
-    lt_endpoint = st.text_input("LanguageTool endpoint", DEFAULT_LT_ENDPOINT)
-    auto_tts = st.checkbox("Play corrected version (TTS)", False)
+    lt_endpoint = st.text_input(
+        "LanguageTool endpoint",
+        value=DEFAULT_LT_ENDPOINT,
+        help="Defaults to the public API (rate limited). Set a custom endpoint in Streamlit Secrets for classes."
+    )
+    auto_tts = st.checkbox("Play the corrected version (TTS)", False)
+    st.caption("This build forces the tiny model for stable performance on Streamlit Cloud.")
 
-# Prompt & rubric
 col1, col2 = st.columns([1.2, 0.8])
+
 with col2:
     st.subheader("🎯 Prompt & Rubric")
     if st.button("Get a prompt"):
         st.session_state["prompt"] = PROMPTS[int(time.time()) % len(PROMPTS)]
-    st.info(st.session_state.get("prompt", "Click above to generate a prompt."))
+    st.info(st.session_state.get("prompt", "Click the button to get a prompt!"))
     st.write("**Guideline rubric:**")
     for item in RUBRIC:
         st.write(item)
 
 with col1:
     st.subheader("🎙️ Record or upload a WAV")
-    wav_bytes = st_audiorecorder("Click to record (auto-stops when silent)")
+
+    # ---- Microphone recorder ----
+    # mic_recorder returns raw WAV bytes by default (when as_raw=True in latest versions),
+    # but many versions return a NumPy array or bytes-like. We handle both.
+    rec = mic_recorder(
+        start_prompt="Start recording",
+        stop_prompt="Stop recording",
+        just_once=False,
+        use_container_width=True,
+        format="wav"  # ensure WAV for simplicity on Cloud
+    )
+
+    wav_bytes: Optional[bytes] = None
+
+    if rec is not None:
+        # Some versions return a dict with "bytes", others return raw bytes/array.
+        if isinstance(rec, dict) and "bytes" in rec and rec["bytes"]:
+            wav_bytes = rec["bytes"]
+        elif isinstance(rec, (bytes, bytearray)):
+            wav_bytes = bytes(rec)
+        elif hasattr(rec, "tobytes"):  # e.g., NumPy array
+            wav_bytes = rec.tobytes()
 
     uploaded = st.file_uploader("…or upload a WAV file", type=["wav"])
 
@@ -187,10 +218,10 @@ with col1:
         st.audio(wav_bytes, format="audio/wav")
 
     elif uploaded:
-        bytes_data = uploaded.read()
-        audio_path, duration = save_wav_bytes_to_file(bytes_data)
+        file_bytes = uploaded.read()
+        audio_path, duration = save_wav_bytes_to_file(file_bytes)
         st.success(f"WAV uploaded ({duration:.1f}s).")
-        st.audio(bytes_data, format="audio/wav")
+        st.audio(file_bytes, format="audio/wav")
 
     if st.button("🧠 Analyze") and audio_path:
         with st.status("Loading ASR model…"):
@@ -200,33 +231,38 @@ with col1:
             text = transcribe(model, audio_path)
 
         st.markdown("### 📝 Transcription")
-        st.write(text)
-
+        st.write(text if text else "*(no transcription)*")
         if not text.strip():
             st.warning("No text to analyze.")
             st.stop()
 
         with st.spinner("Analyzing grammar…"):
-            lt_data = call_languagetool(text, lt_endpoint)
-            matches = parse_lt_matches(lt_data)
+            try:
+                lt_json = call_languagetool(text, lt_endpoint)
+                matches = parse_lt_matches(lt_json)
+            except Exception as e:
+                st.error(f"LanguageTool error: {e}")
+                matches = []
 
         st.markdown("### ✍️ Issues & suggestions")
         if not matches:
-            st.info("No significant issues found.")
+            st.info("No significant issues found (or API limit reached).")
         else:
             for i, m in enumerate(matches, 1):
-                sug = m.replacements[0] if m.replacements else "—"
+                suggestion = m.replacements[0] if m.replacements else "—"
                 with st.expander(f"#{i} {m.message}"):
                     st.write(f"**Sentence:** {m.sentence}")
-                    st.write(f"**Suggestion:** `{sug}`")
+                    st.write(f"**Suggestion:** `{suggestion}`")
+                    st.write(f"Rule: `{m.rule_id}` • Category: `{m.category}`")
 
         corrected = apply_corrections(text, matches)
-        st.markdown("### ✅ Corrected version")
+        st.markdown("### ✅ Corrected version (auto-generated)")
         st.write(corrected)
 
-        if auto_tts:
+        if auto_tts and corrected.strip():
             audio = tts_bytes(corrected)
             st.audio(audio, format="audio/mp3")
+            st.download_button("⬇️ Download audio (MP3)", data=audio, file_name="correction.mp3", mime="audio/mpeg")
 
         metrics = compute_text_metrics(text)
         wpm = round(metrics["n_words"] / (duration / 60), 1) if duration > 0 else 0
@@ -236,6 +272,6 @@ with col1:
         cA.metric("Words", metrics["n_words"])
         cA.metric("Sentences", metrics["n_sentences"])
         cB.metric("TTR", metrics["ttr"])
-        cB.metric("Avg sentence length", metrics["avg_sentence_len"])
+        cB.metric("Avg. sentence length", metrics["avg_sentence_len"])
         cC.metric("WPM", wpm)
         cC.metric("Level (est.)", estimate_cefr(metrics))
