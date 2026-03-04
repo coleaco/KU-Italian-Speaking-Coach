@@ -1,7 +1,8 @@
 # app.py — Streamlit Cloud–friendly Italian speaking app (English UI)
 # - Uses streamlit-mic-recorder (with graceful fallback to upload)
-# - faster-whisper (tiny, CPU, int8) for reliability on Streamlit Cloud
-# - LanguageTool grammar/style analysis tuned for speech (writing nits suppressed)
+# - faster-whisper (tiny, CPU, int8) tuned for better results on Cloud
+# - LanguageTool grammar/style tuned for speech (writing nits suppressed)
+# - Robust LT handling: rate-limit detection, timeouts, debounce, short-utterance guard
 # - WAV-only to avoid extra media dependencies
 # - Lightweight text metrics (WPM, TTR, avg sentence length)
 # - Optional TTS (gTTS) to hear the corrected version
@@ -77,6 +78,10 @@ class LTMatch:
 # -------- Utilities --------
 # ---------------------------
 
+def screenshot_safe(s: str) -> str:
+    """Avoid code formatting issues if suggestions contain backticks."""
+    return s.replace("`", "´")
+
 @st.cache_resource(show_spinner=False)
 def load_fw_model() -> WhisperModel:
     """Load faster-whisper (cached). Tiny+int8 is Cloud-friendly."""
@@ -96,7 +101,7 @@ def get_wav_duration(path: str) -> float:
         rate = wf.getframerate() or 16000
         return frames / float(rate)
 
-# ---- PATCHED: Transcribe with improved decoding/VAD for tiny ----
+# ---- Transcribe with improved decoding/VAD for tiny ----
 def transcribe(model: WhisperModel, wav_path: str) -> str:
     """
     Transcribe Italian speech using faster-whisper with settings tuned to
@@ -130,23 +135,34 @@ def transcribe(model: WhisperModel, wav_path: str) -> str:
     )
     return " ".join(s.text.strip() for s in segments if s.text).strip()
 
-# ---- PATCHED: LanguageTool call focused on speech grammar/style ----
+# ---- LanguageTool call focused on speech grammar/style + robust handling ----
 def call_languagetool(text: str, endpoint: str) -> Dict:
     """
-    Call LanguageTool but suppress 'writing' categories (typos, casing, punctuation).
-    This keeps feedback focused on speech grammar/morphosyntax and style.
+    Call LanguageTool and suppress writing-centric categories.
+    Returns a dict with keys: {"ok": bool, "rate_limited": bool, "data": dict}
     """
     payload = {
         "text": text,
         "language": "it",
-        # Suppress writing-only categories
+        # Keep feedback speech-oriented:
         "disabledCategories": "TYPOS,CASING,PUNCTUATION",
-        # If you still see noisy rules, list them here:
-        # "disabledRules": "UPPERCASE_SENTENCE_START,COMMA_PARENTHESIS_WHITESPACE",
     }
-    r = requests.post(endpoint, data=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    headers = {
+        "User-Agent": "KU-Italian-Speaking-Coach/1.0 (+educational use)",
+    }
+
+    try:
+        r = requests.post(endpoint, data=payload, headers=headers, timeout=15)
+        # Public API may return 429 for bursts
+        if r.status_code == 429:
+            return {"ok": False, "rate_limited": True, "data": {}}
+        r.raise_for_status()
+        return {"ok": True, "rate_limited": False, "data": r.json()}
+    except requests.exceptions.Timeout:
+        return {"ok": False, "rate_limited": False, "data": {}}
+    except requests.RequestException:
+        # Network / other server errors
+        return {"ok": False, "rate_limited": False, "data": {}}
 
 def parse_lt_matches(data: Dict) -> List[LTMatch]:
     """
@@ -217,6 +233,16 @@ def tts_bytes(text: str) -> io.BytesIO:
     return buf
 
 # ---------------------------
+# ---- Session-level UX -----
+# ---------------------------
+
+# Simple per-session debounce to avoid spamming LT when users click rapidly
+if "last_lt_call_ts" not in st.session_state:
+    st.session_state["last_lt_call_ts"] = 0.0
+
+LT_MIN_INTERVAL_SEC = 2.0  # don't call LT more frequently than every 2s
+
+# ---------------------------
 # ------------ UI -----------
 # ---------------------------
 
@@ -231,6 +257,10 @@ with st.sidebar:
         help="Defaults to the public API (rate limited). Use Streamlit Secrets to set a custom endpoint for classes."
     )
     auto_tts = st.checkbox("Play the corrected version (TTS)", False)
+    st.caption(
+        "Using the public LanguageTool endpoint may hit rate limits during busy periods. "
+        "For classes, consider a private LT server and set its URL here."
+    )
     st.caption("This build forces the tiny ASR model for stability on Streamlit Cloud. WAV input only.")
 
 col1, col2 = st.columns([1.2, 0.8])
@@ -309,21 +339,76 @@ with col1:
             st.warning("No text to analyze.")
             st.stop()
 
-        # Grammar & style (speech-focused)
+        # --- Decide whether to call LT now (short utterance + debounce) ---
+        min_words_for_lt = 5
+        word_count = len([w for w in text.split() if w.strip()])
+        should_call_lt = word_count >= min_words_for_lt
+
+        now = time.time()
+        if now - st.session_state["last_lt_call_ts"] < LT_MIN_INTERVAL_SEC:
+            should_call_lt = False  # too soon; skip this round silently
+        else:
+            st.session_state["last_lt_call_ts"] = now
+
+        # Grammar & style (speech-focused) with robust handling
+        lt_result = {"ok": False, "rate_limited": False, "data": {}}
+        matches: List[LTMatch] = []
         with st.spinner("Analyzing grammar…"):
-            try:
-                lt_json = call_languagetool(text, lt_endpoint)
-                matches = parse_lt_matches(lt_json)
-            except Exception as e:
-                st.error(f"LanguageTool error: {e}")
+            if should_call_lt:
+                lt_result = call_languagetool(text, lt_endpoint)
+                if lt_result["ok"]:
+                    matches = parse_lt_matches(lt_result["data"])
+            else:
                 matches = []
 
+        # Clear messaging for users
         st.markdown("### ✍️ Issues & suggestions (speech-focused)")
-        if not matches:
-            st.info("No significant grammar/style issues found (or API limit reached).")
+        if lt_result.get("rate_limited"):
+            st.warning("LanguageTool public API limit reached. Please wait a few seconds and try again, or configure a private endpoint in Settings.")
+        elif not should_call_lt:
+            if word_count < min_words_for_lt:
+                st.info("Speak a bit more to get grammar/style feedback (≥ 5 words).")
+            else:
+                st.info("Analyzing… please try again in a second.")
+        elif not matches:
+            st.info("No significant grammar/style issues found.")
         else:
             for i, m in enumerate(matches, 1):
                 suggestion = m.replacements[0] if m.replacements else "—"
                 with st.expander(f"#{i} {m.message}"):
                     st.write(f"**Sentence:** {m.sentence}")
                     st.write(f"**Suggestion:** `{screenshot_safe(suggestion)}`")
+                    st.write(f"Rule: `{m.rule_id}` • Category: `{m.category}`")
+
+        # Corrected (grammar-focused, not capitalizing for 'writing')
+        corrected = apply_corrections(text, matches)
+        st.markdown("### ✅ Corrected version (grammar-focused)")
+        st.write(corrected)
+
+        # TTS
+        if auto_tts and corrected.strip():
+            try:
+                audio = tts_bytes(corrected)
+                st.audio(audio, format="audio/mp3")
+                st.download_button("⬇️ Download audio (MP3)", data=audio, file_name="correction.mp3", mime="audio/mpeg")
+            except Exception as e:
+                st.warning(f"TTS unavailable: {e}")
+
+        # Metrics
+        metrics = compute_text_metrics(text)
+        wpm = round(metrics["n_words"] / (duration / 60), 1) if duration > 0 else 0
+
+        st.markdown("### 📊 Indicators")
+        cA, cB, cC = st.columns(3)
+        cA.metric("Words", metrics["n_words"])
+        cA.metric("Sentences", metrics["n_sentences"])
+        cB.metric("TTR (lexical diversity)", metrics["ttr"])
+        cB.metric("Avg. sentence length", metrics["avg_sentence_len"])
+        cC.metric("WPM", wpm)
+        cC.metric("Level (estimate)", estimate_cefr(metrics))
+
+st.markdown("---")
+st.caption(
+    "This build is optimized for Streamlit Cloud: it forces the tiny ASR model and accepts WAV input only. "
+    "For heavier classroom use, consider setting a self-hosted LanguageTool endpoint via Secrets."
+)
