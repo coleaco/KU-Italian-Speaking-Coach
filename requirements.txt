@@ -1,5 +1,5 @@
 streamlit==1.31.0
-audio-recorder-streamlit==0.0.9
+st-audio-recorder==0.3.0
 faster-whisper==1.0.3
 numpy
 requests

@@ -1,0 +1,42 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+.profile_default/
+
+# Local settings
+*.env
+.env.*
+*.log
+
+# ---- Streamlit ----
+.streamlit/
+.streamlit/secrets.toml
+
+# ---- OS / editors ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Model / cache dirs (if you experiment locally) ----
+models/
+.cache/
+.cache/huggingface/
+*.bin
+
+# Audio test artifacts
+*.wav
+*.mp3
