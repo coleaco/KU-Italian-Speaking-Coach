@@ -1,10 +1,11 @@
 # ---------------------------------------------------------
 # Italian Speaking Practice (Updated Edition)
-# - Adds ASR model selector (tiny/base/small)
-# - Adds word-level timestamps + low-confidence highlighting
-# - Adds Italian apostrophe normalization
+# - ASR model selector (tiny/base/small)
+# - Word-level timestamps + low-confidence highlighting
+# - Italian apostrophe normalization
 # - Improved transcription with temperature fallback
-# - Preserves all existing LT + TTS features
+# - Uploader now accepts WAV/MP3/M4A/OGG/WEBM
+# - Preserves LT + TTS features (free tools only)
 # ---------------------------------------------------------
 
 import os
@@ -81,19 +82,22 @@ def load_fw_model(name: str, compute: str) -> WhisperModel:
     """Load faster-whisper (cached) with chosen model + compute type."""
     return WhisperModel(name, device="cpu", compute_type=compute)
 
-def save_wav_bytes_to_file(wav_bytes: bytes) -> Tuple[str, float]:
-    """Save WAV bytes to a temp file and return path + duration."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+def save_bytes_to_file(data: bytes, suffix: str) -> str:
+    """Save raw bytes to a temp file with provided suffix (e.g., '.mp3', '.wav')."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     with open(tmp.name, "wb") as f:
-        f.write(wav_bytes)
-    return tmp.name, get_wav_duration(tmp.name)
+        f.write(data)
+    return tmp.name
 
-def get_wav_duration(path: str) -> float:
-    """Read WAV header for duration."""
-    with wave.open(path, "rb") as wf:
-        frames = wf.getnframes()
-        rate = wf.getframerate() or 16000
-        return frames / float(rate)
+def wav_duration_seconds(path: str) -> float:
+    """Duration from WAV header; for non-WAV we compute duration from transcription later."""
+    try:
+        with wave.open(path, "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 16000
+            return frames / float(rate)
+    except wave.Error:
+        return 0.0
 
 # ---------------------------
 # ---- Italian normalization -
@@ -120,7 +124,7 @@ def normalize_italian_text(text: str) -> str:
 # ---- Transcription w/ timestamps
 # ---------------------------
 
-def transcribe(model: WhisperModel, wav_path: str):
+def transcribe(model: WhisperModel, audio_path: str):
     """
     Transcribe Italian audio with word timestamps + temperature fallback.
     Returns (full_text, words, seg_stats).
@@ -128,7 +132,7 @@ def transcribe(model: WhisperModel, wav_path: str):
     temperature = [0.0, 0.2, 0.4]
 
     segments, _info = model.transcribe(
-        wav_path,
+        audio_path,
         language="it",
         task="transcribe",
         vad_filter=True,
@@ -158,10 +162,8 @@ def transcribe(model: WhisperModel, wav_path: str):
 
         if getattr(s, "words", None):
             for w in s.words:
-                # confidence proxy using segment avg_logprob
                 avg = s.avg_logprob if s.avg_logprob is not None else -5.0
-                # naive mapping: more negative = lower confidence
-                conf = max(min((avg + 5) / 5, 1.0), 0.0)
+                conf = max(min((avg + 5) / 5, 1.0), 0.0)  # heuristic confidence proxy
                 words.append({
                     "word": w.word,
                     "start": float(getattr(w, "start", 0.0) or 0.0),
@@ -203,16 +205,23 @@ def call_languagetool(text: str, endpoint: str) -> Dict:
     except requests.RequestException:
         return {"ok": False, "rate_limited": False, "data": {}}
 
+@dataclass
+class LTMatch:
+    message: str
+    offset: int
+    length: int
+    replacements: List[str]
+    rule_id: str
+    sentence: str
+    category: str
+
 def parse_lt_matches(data: Dict) -> List[LTMatch]:
     out = []
     for m in data.get("matches", []):
         rule = m.get("rule") or {}
         cat = (rule.get("category") or {}).get("id", "")
-
-        # Extra filter for writing-focused categories
         if cat in {"TYPOS", "CASING", "PUNCTUATION"}:
             continue
-
         reps = [r.get("value") for r in m.get("replacements", [])]
         out.append(
             LTMatch(
@@ -321,11 +330,11 @@ with col2:
         st.write(item)
 
 with col1:
-    st.subheader("🎙️ Record or upload a WAV")
+    st.subheader("🎙️ Record or upload audio")
 
     wav_bytes: Optional[bytes] = None
 
-    # Recorder
+    # Recorder (WAV)
     if MIC_AVAILABLE:
         rec = mic_recorder(
             start_prompt="Start recording",
@@ -340,20 +349,37 @@ with col1:
             elif isinstance(rec, (bytes, bytearray)):
                 wav_bytes = bytes(rec)
 
-    uploaded = st.file_uploader("…or upload a WAV file", type=["wav"])
+    # ---- Uploader: accept multiple types ----
+    accepted_types = ["wav", "mp3", "m4a", "ogg", "webm"]
+    uploaded = st.file_uploader("…or upload an audio file", type=accepted_types)
 
     audio_path = None
-    duration = 0.0
+    input_duration = 0.0  # only reliable for WAV; for others we'll compute from segments
 
+    # Recorder path (always WAV)
     if wav_bytes:
-        audio_path, duration = save_wav_bytes_to_file(wav_bytes)
-        st.success(f"Recording captured ({duration:.1f}s).")
+        audio_path = save_bytes_to_file(wav_bytes, ".wav")
+        input_duration = wav_duration_seconds(audio_path)
+        st.success(f"Recording captured ({input_duration:.1f}s).")
         st.audio(wav_bytes, format="audio/wav")
+
+    # Uploaded file path (keep original suffix)
     elif uploaded:
         file_bytes = uploaded.read()
-        audio_path, duration = save_wav_bytes_to_file(file_bytes)
-        st.success(f"WAV uploaded ({duration:.1f}s).")
-        st.audio(file_bytes, format="audio/wav")
+        # Determine suffix from filename (fallback to .wav if missing)
+        suffix = os.path.splitext(uploaded.name)[1].lower() or ".wav"
+        # Safety: restrict to accepted suffixes even if the extension is odd
+        if suffix.lstrip(".") not in accepted_types:
+            st.error("Unsupported file type. Please upload WAV, MP3, M4A, OGG, or WEBM.")
+            st.stop()
+        audio_path = save_bytes_to_file(file_bytes, suffix)
+        # Only compute header-based duration for WAV; others computed after transcription.
+        if suffix == ".wav":
+            input_duration = wav_duration_seconds(audio_path)
+            st.success(f"Audio uploaded ({input_duration:.1f}s).")
+        else:
+            st.success(f"Audio uploaded ({suffix[1:].upper()}).")
+        st.audio(file_bytes)
 
     # ---- Analyze ----
     if st.button("🧠 Analyze") and audio_path:
@@ -466,7 +492,14 @@ with col1:
 
         # Indicators
         metrics = compute_text_metrics(text)
-        wpm = round(metrics["n_words"] / (duration / 60), 1) if duration > 0 else 0
+
+        # Use WAV header duration if available; otherwise derive from last segment end time
+        if input_duration and input_duration > 0:
+            duration_sec = input_duration
+        else:
+            duration_sec = seg_stats[-1]["end"] if seg_stats else 0.0
+
+        wpm = round(metrics["n_words"] / (duration_sec / 60), 1) if duration_sec > 0 else 0
 
         st.markdown("### 📊 Indicators")
         cA, cB, cC = st.columns(3)
@@ -479,6 +512,6 @@ with col1:
 
 st.markdown("---")
 st.caption(
-    "This version supports multiple Whisper models, word-level timestamps, "
-    "Italian normalization, and improved transcription. Everything remains free."
+    "Uploader accepts WAV/MP3/M4A/OGG/WEBM. Duration is from WAV header when available; "
+    "otherwise estimated from transcription timing."
 )
