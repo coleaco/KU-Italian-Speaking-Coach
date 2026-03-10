@@ -1,11 +1,11 @@
-# app.py — Streamlit Cloud–friendly Italian speaking app (English UI)
-# - Uses streamlit-mic-recorder (with graceful fallback to upload)
-# - faster-whisper (tiny, CPU, int8) tuned for better results on Cloud
-# - LanguageTool grammar/style tuned for speech (writing nits suppressed)
-# - Robust LT handling: rate-limit detection, timeouts, debounce, short-utterance guard
-# - WAV-only to avoid extra media dependencies
-# - Lightweight text metrics (WPM, TTR, avg sentence length)
-# - Optional TTS (gTTS) to hear the corrected version
+# ---------------------------------------------------------
+# Italian Speaking Practice (Updated Edition)
+# - Adds ASR model selector (tiny/base/small)
+# - Adds word-level timestamps + low-confidence highlighting
+# - Adds Italian apostrophe normalization
+# - Improved transcription with temperature fallback
+# - Preserves all existing LT + TTS features
+# ---------------------------------------------------------
 
 import os
 import io
@@ -15,7 +15,6 @@ import wave
 import tempfile
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-
 import numpy as np
 import streamlit as st
 
@@ -29,18 +28,13 @@ except Exception:
 from faster_whisper import WhisperModel
 import requests
 from gtts import gTTS
+import re
 
 # ---------------------------
 # ---------- Config ----------
 # ---------------------------
 
-# Public LanguageTool by default (rate-limited).
-# You can override via Streamlit "Secrets" or environment variable.
 DEFAULT_LT_ENDPOINT = os.getenv("LT_ENDPOINT", "https://api.languagetool.org/v2/check")
-
-# Cloud-safe defaults
-ASR_MODEL_NAME = "tiny"   # Force tiny for Streamlit Cloud
-ASR_COMPUTE = "int8"      # Fastest CPU compute type
 
 PROMPTS = [
     "Describe your ideal day from start to finish.",
@@ -83,77 +77,123 @@ def screenshot_safe(s: str) -> str:
     return s.replace("`", "´")
 
 @st.cache_resource(show_spinner=False)
-def load_fw_model() -> WhisperModel:
-    """Load faster-whisper (cached). Tiny+int8 is Cloud-friendly."""
-    return WhisperModel(ASR_MODEL_NAME, device="cpu", compute_type=ASR_COMPUTE)
+def load_fw_model(name: str, compute: str) -> WhisperModel:
+    """Load faster-whisper (cached) with chosen model + compute type."""
+    return WhisperModel(name, device="cpu", compute_type=compute)
 
 def save_wav_bytes_to_file(wav_bytes: bytes) -> Tuple[str, float]:
-    """Save WAV bytes to a temp file and return path + duration (seconds)."""
+    """Save WAV bytes to a temp file and return path + duration."""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
     with open(tmp.name, "wb") as f:
         f.write(wav_bytes)
     return tmp.name, get_wav_duration(tmp.name)
 
 def get_wav_duration(path: str) -> float:
-    """Read WAV header to compute duration."""
+    """Read WAV header for duration."""
     with wave.open(path, "rb") as wf:
         frames = wf.getnframes()
         rate = wf.getframerate() or 16000
         return frames / float(rate)
 
-# ---- Transcribe with improved decoding/VAD for tiny ----
-def transcribe(model: WhisperModel, wav_path: str) -> str:
-    """
-    Transcribe Italian speech using faster-whisper with settings tuned to
-    squeeze better accuracy out of the 'tiny' model on learner speech.
+# ---------------------------
+# ---- Italian normalization -
+# ---------------------------
 
-    Key tweaks:
-      - beam_size=5, best_of=5 for better sequence selection
-      - temperature=0.0 for deterministic decoding (fewer hallucinations)
-      - condition_on_previous_text=False to avoid error carryover
-      - initial_prompt in Italian to bias toward standard Italian output
-      - VAD with slightly shorter silence to segment learner speech
+MULTISPACE = re.compile(r"\s{2,}")
+
+def normalize_italian_text(text: str) -> str:
+    """Fix spacing around apostrophes and common elisions."""
+    # Merge "l ' amico" → "l'amico"
+    text = re.sub(
+        r"\b([lLdDaAeEoOuU]l?)\s*'\s*([a-zA-Zàèéìòóù])",
+        r"\1'\2",
+        text
+    )
+    # Clean stray spaces
+    text = text.replace(" ’ ", "’").replace(" ' ", "'")
+    text = text.replace(" ’", "’").replace("’ ", "’")
+    text = text.replace(" '", "'").replace("' ", "'")
+    text = MULTISPACE.sub(" ", text)
+    return text.strip()
+
+# ---------------------------
+# ---- Transcription w/ timestamps
+# ---------------------------
+
+def transcribe(model: WhisperModel, wav_path: str):
     """
-    segments, _ = model.transcribe(
+    Transcribe Italian audio with word timestamps + temperature fallback.
+    Returns (full_text, words, seg_stats).
+    """
+    temperature = [0.0, 0.2, 0.4]
+
+    segments, _info = model.transcribe(
         wav_path,
         language="it",
         task="transcribe",
         vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 600},
+        vad_parameters={"min_silence_duration_ms": 500},
         beam_size=5,
         best_of=5,
-        temperature=0.0,
+        temperature=temperature,
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
         initial_prompt=(
             "Trascrivi in italiano standard senza riformulare. "
-            "Evita correzioni di maiuscole non necessarie. "
-            "Non tradurre, mantieni la lingua italiana."
+            "Evita correzioni non necessarie. Non tradurre."
         ),
-        condition_on_previous_text=False
+        condition_on_previous_text=False,
+        word_timestamps=True,
+        without_timestamps=False
     )
-    return " ".join(s.text.strip() for s in segments if s.text).strip()
 
-# ---- LanguageTool call focused on speech grammar/style + robust handling ----
+    words = []
+    seg_stats = []
+    texts = []
+
+    for s in segments:
+        if s.text:
+            texts.append(s.text.strip())
+
+        if getattr(s, "words", None):
+            for w in s.words:
+                # confidence proxy using segment avg_logprob
+                avg = s.avg_logprob if s.avg_logprob is not None else -5.0
+                # naive mapping: more negative = lower confidence
+                conf = max(min((avg + 5) / 5, 1.0), 0.0)
+                words.append({
+                    "word": w.word,
+                    "start": float(getattr(w, "start", 0.0) or 0.0),
+                    "end": float(getattr(w, "end", 0.0) or 0.0),
+                    "conf": float(conf)
+                })
+
+        seg_stats.append({
+            "start": float(getattr(s, "start", 0.0) or 0.0),
+            "end": float(getattr(s, "end", 0.0) or 0.0),
+            "avg_logprob": float(getattr(s, "avg_logprob", -5.0)),
+            "no_speech_prob": float(getattr(s, "no_speech_prob", 0.0)),
+        })
+
+    full_text = " ".join(texts).strip()
+    return full_text, words, seg_stats
+
+# ---------------------------
+# ---- LanguageTool API -----
+# ---------------------------
+
 def call_languagetool(text: str, endpoint: str) -> Dict:
-    """
-    Call LanguageTool and suppress writing-centric categories.
-    Returns a dict with keys: {"ok": bool, "rate_limited": bool, "data": dict}
-    """
     payload = {
         "text": text,
         "language": "it",
-        # Keep feedback speech-oriented:
         "disabledCategories": "TYPOS,CASING,PUNCTUATION",
     }
     headers = {
         "User-Agent": "KU-Italian-Speaking-Coach/1.0 (+educational use)",
     }
-
     try:
         r = requests.post(endpoint, data=payload, headers=headers, timeout=15)
-        # Public API may return 429 for bursts
         if r.status_code == 429:
             return {"ok": False, "rate_limited": True, "data": {}}
         r.raise_for_status()
@@ -161,21 +201,18 @@ def call_languagetool(text: str, endpoint: str) -> Dict:
     except requests.exceptions.Timeout:
         return {"ok": False, "rate_limited": False, "data": {}}
     except requests.RequestException:
-        # Network / other server errors
         return {"ok": False, "rate_limited": False, "data": {}}
 
 def parse_lt_matches(data: Dict) -> List[LTMatch]:
-    """
-    Parse LT matches AND defensively filter out writing-only categories that
-    might still slip through (double safety).
-    """
-    out: List[LTMatch] = []
+    out = []
     for m in data.get("matches", []):
         rule = m.get("rule") or {}
-        cat  = (rule.get("category") or {}).get("id", "")
-        # Filter writing-only categories at UI layer as well
+        cat = (rule.get("category") or {}).get("id", "")
+
+        # Extra filter for writing-focused categories
         if cat in {"TYPOS", "CASING", "PUNCTUATION"}:
             continue
+
         reps = [r.get("value") for r in m.get("replacements", [])]
         out.append(
             LTMatch(
@@ -191,7 +228,7 @@ def parse_lt_matches(data: Dict) -> List[LTMatch]:
     return out
 
 def apply_corrections(text: str, matches: List[LTMatch]) -> str:
-    """Apply first suggested replacement for each match (right-to-left)."""
+    """Apply first replacement for each match (right-to-left)."""
     out = text
     for m in sorted(matches, key=lambda x: x.offset, reverse=True):
         if m.replacements and m.length > 0:
@@ -201,7 +238,6 @@ def apply_corrections(text: str, matches: List[LTMatch]) -> str:
     return out
 
 def compute_text_metrics(text: str) -> Dict[str, float]:
-    """Lightweight text metrics: words, sentences, TTR, avg sentence length."""
     words = [w.strip(".,;:!?\"'()[]{}").lower() for w in text.split() if w.strip()]
     if not words:
         return {"n_words": 0, "n_sentences": 0, "ttr": 0.0, "avg_sentence_len": 0.0}
@@ -214,62 +250,72 @@ def compute_text_metrics(text: str) -> Dict[str, float]:
     }
 
 def estimate_cefr(metrics: Dict[str, float]) -> str:
-    """Very rough CEFR-ish hint based on lexical diversity and sentence length."""
     score = 0
     if metrics["ttr"] >= 0.6: score += 2
     elif metrics["ttr"] >= 0.45: score += 1
     if metrics["avg_sentence_len"] >= 18: score += 2
     elif metrics["avg_sentence_len"] >= 12: score += 1
-    return ("C1 (approx.)" if score >= 5 else
-            "B2 (approx.)" if score >= 3 else
-            "B1 (approx.)" if score >= 2 else
-            "A2 or lower (approx.)")
+    return (
+        "C1 (approx.)" if score >= 5 else
+        "B2 (approx.)" if score >= 3 else
+        "B1 (approx.)" if score >= 2 else
+        "A2 or lower (approx.)"
+    )
 
 def tts_bytes(text: str) -> io.BytesIO:
-    """Generate MP3 TTS audio for the corrected text (Italian)."""
     buf = io.BytesIO()
     gTTS(text, lang="it").write_to_fp(buf)
     buf.seek(0)
     return buf
 
 # ---------------------------
-# ---- Session-level UX -----
+# ---- Session debounce -----
 # ---------------------------
 
-# Simple per-session debounce to avoid spamming LT when users click rapidly
 if "last_lt_call_ts" not in st.session_state:
     st.session_state["last_lt_call_ts"] = 0.0
 
-LT_MIN_INTERVAL_SEC = 2.0  # don't call LT more frequently than every 2s
+LT_MIN_INTERVAL_SEC = 2.0
 
 # ---------------------------
 # ------------ UI -----------
 # ---------------------------
 
-st.set_page_config(page_title="Italian Speaking Practice (Cloud)", page_icon="🇮🇹", layout="wide")
-st.title("🇮🇹 Italian Speaking Practice — Cloud Edition (tiny ASR model)")
+st.set_page_config(
+    page_title="Italian Speaking Practice — Updated",
+    page_icon="🇮🇹",
+    layout="wide"
+)
 
+st.title("🇮🇹 Italian Speaking Practice — Updated Edition")
+
+# Sidebar
 with st.sidebar:
     st.header("Settings")
+
     lt_endpoint = st.text_input(
         "LanguageTool endpoint",
-        value=DEFAULT_LT_ENDPOINT,
-        help="Defaults to the public API (rate limited). Use Streamlit Secrets to set a custom endpoint for classes."
+        value=DEFAULT_LT_ENDPOINT
     )
+
     auto_tts = st.checkbox("Play the corrected version (TTS)", False)
-    st.caption(
-        "Using the public LanguageTool endpoint may hit rate limits during busy periods. "
-        "For classes, consider a private LT server and set its URL here."
-    )
-    st.caption("This build forces the tiny ASR model for stability on Streamlit Cloud. WAV input only.")
+
+    st.subheader("ASR Model")
+    model_name = st.selectbox("Model size", ["tiny", "base", "small"], index=0)
+    compute_type = st.selectbox("Compute type", ["int8", "int8_float16", "float16"], index=0)
+
+    st.caption("For best accuracy: try 'small' + 'int8_float16' (slower but better).")
 
 col1, col2 = st.columns([1.2, 0.8])
 
 with col2:
     st.subheader("🎯 Prompt & Rubric")
+
     if st.button("Get a prompt"):
         st.session_state["prompt"] = PROMPTS[int(time.time()) % len(PROMPTS)]
+
     st.info(st.session_state.get("prompt", "Click the button to get a prompt!"))
+
     st.write("**Guideline rubric:**")
     for item in RUBRIC:
         st.write(item)
@@ -277,27 +323,22 @@ with col2:
 with col1:
     st.subheader("🎙️ Record or upload a WAV")
 
-    # ---- Microphone recorder (with graceful fallback) ----
     wav_bytes: Optional[bytes] = None
 
+    # Recorder
     if MIC_AVAILABLE:
         rec = mic_recorder(
             start_prompt="Start recording",
             stop_prompt="Stop recording",
             just_once=False,
             use_container_width=True,
-            format="wav"  # ensure WAV output for simplicity
+            format="wav"
         )
         if rec is not None:
-            # Normalize different return formats across versions
             if isinstance(rec, dict) and rec.get("bytes"):
                 wav_bytes = rec["bytes"]
             elif isinstance(rec, (bytes, bytearray)):
                 wav_bytes = bytes(rec)
-            elif hasattr(rec, "tobytes"):  # e.g., NumPy array
-                wav_bytes = rec.tobytes()
-    else:
-        st.info("Microphone recorder is unavailable here. Please upload a WAV instead.")
 
     uploaded = st.file_uploader("…or upload a WAV file", type=["wav"])
 
@@ -314,62 +355,87 @@ with col1:
         st.success(f"WAV uploaded ({duration:.1f}s).")
         st.audio(file_bytes, format="audio/wav")
 
-    # ---- Analyze button ----
+    # ---- Analyze ----
     if st.button("🧠 Analyze") and audio_path:
-        # Load ASR model (cached)
         with st.status("Loading ASR model…", expanded=False) as status:
             try:
-                model = load_fw_model()
-                status.update(label="Model ready", state="complete", expanded=False)
+                model = load_fw_model(model_name, compute_type)
+                status.update(
+                    label=f"Model ready: {model_name}/{compute_type}",
+                    state="complete",
+                    expanded=False
+                )
             except Exception as e:
                 st.error(f"Model loading error: {e}")
                 st.stop()
 
-        # Transcribe
         with st.spinner("Transcribing…"):
             try:
-                text = transcribe(model, audio_path)
+                text, words, seg_stats = transcribe(model, audio_path)
             except Exception as e:
                 st.error(f"Transcription error: {e}")
                 st.stop()
 
+        text = normalize_italian_text(text)
+
         st.markdown("### 📝 Transcription")
         st.write(text if text else "*(no transcription)*")
-        if not text.strip():
-            st.warning("No text to analyze.")
-            st.stop()
 
-        # --- Decide whether to call LT now (short utterance + debounce) ---
-        min_words_for_lt = 5
+        # Highlight uncertain words
+        if words:
+            def render_word_spans(words_list):
+                spans = []
+                for w in words_list:
+                    dur = (w["end"] - w["start"]) if w["end"] > w["start"] else 0.0
+                    low_conf = (w["conf"] < 0.30) or (dur < 0.06)
+                    if low_conf:
+                        spans.append(
+                            f"<span style='background:#fff3cd;padding:2px 4px;border-radius:4px'>{w['word']}</span>"
+                        )
+                    else:
+                        spans.append(w["word"])
+                return " ".join(spans)
+
+            st.markdown("#### 🔎 Low‑confidence words (highlighted)")
+            st.markdown(render_word_spans(words), unsafe_allow_html=True)
+
+            st.download_button(
+                "⬇️ Download words+timestamps (JSON)",
+                data=json.dumps({"words": words, "segments": seg_stats}, ensure_ascii=False, indent=2),
+                file_name="alignment.json",
+                mime="application/json",
+            )
+
+        # --- Grammar analysis (LanguageTool) ---
         word_count = len([w for w in text.split() if w.strip()])
-        should_call_lt = word_count >= min_words_for_lt
+        should_call_lt = word_count >= 5
 
         now = time.time()
         if now - st.session_state["last_lt_call_ts"] < LT_MIN_INTERVAL_SEC:
-            should_call_lt = False  # too soon; skip this round silently
+            should_call_lt = False
         else:
             st.session_state["last_lt_call_ts"] = now
 
-        # Grammar & style (speech-focused) with robust handling
         lt_result = {"ok": False, "rate_limited": False, "data": {}}
         matches: List[LTMatch] = []
+
         with st.spinner("Analyzing grammar…"):
             if should_call_lt:
                 lt_result = call_languagetool(text, lt_endpoint)
                 if lt_result["ok"]:
                     matches = parse_lt_matches(lt_result["data"])
-            else:
-                matches = []
+                else:
+                    matches = []
 
-        # Clear messaging for users
-        st.markdown("### ✍️ Issues & suggestions (speech-focused)")
+        st.markdown("### ✍️ Issues & suggestions")
+
         if lt_result.get("rate_limited"):
-            st.warning("LanguageTool public API limit reached. Please wait a few seconds and try again, or configure a private endpoint in Settings.")
+            st.warning("LanguageTool public API limit reached. Try again soon.")
         elif not should_call_lt:
-            if word_count < min_words_for_lt:
+            if word_count < 5:
                 st.info("Speak a bit more to get grammar/style feedback (≥ 5 words).")
             else:
-                st.info("Analyzing… please try again in a second.")
+                st.info("Analyzing… please try again in a moment.")
         elif not matches:
             st.info("No significant grammar/style issues found.")
         else:
@@ -380,21 +446,25 @@ with col1:
                     st.write(f"**Suggestion:** `{screenshot_safe(suggestion)}`")
                     st.write(f"Rule: `{m.rule_id}` • Category: `{m.category}`")
 
-        # Corrected (grammar-focused, not capitalizing for 'writing')
-        corrected = apply_corrections(text, matches)
-        st.markdown("### ✅ Corrected version (grammar-focused)")
+        corrected = normalize_italian_text(apply_corrections(text, matches))
+
+        st.markdown("### ✅ Corrected version")
         st.write(corrected)
 
-        # TTS
         if auto_tts and corrected.strip():
             try:
                 audio = tts_bytes(corrected)
                 st.audio(audio, format="audio/mp3")
-                st.download_button("⬇️ Download audio (MP3)", data=audio, file_name="correction.mp3", mime="audio/mpeg")
+                st.download_button(
+                    "⬇️ Download audio (MP3)",
+                    data=audio,
+                    file_name="correction.mp3",
+                    mime="audio/mpeg"
+                )
             except Exception as e:
                 st.warning(f"TTS unavailable: {e}")
 
-        # Metrics
+        # Indicators
         metrics = compute_text_metrics(text)
         wpm = round(metrics["n_words"] / (duration / 60), 1) if duration > 0 else 0
 
@@ -402,13 +472,13 @@ with col1:
         cA, cB, cC = st.columns(3)
         cA.metric("Words", metrics["n_words"])
         cA.metric("Sentences", metrics["n_sentences"])
-        cB.metric("TTR (lexical diversity)", metrics["ttr"])
+        cB.metric("TTR", metrics["ttr"])
         cB.metric("Avg. sentence length", metrics["avg_sentence_len"])
         cC.metric("WPM", wpm)
         cC.metric("Level (estimate)", estimate_cefr(metrics))
 
 st.markdown("---")
 st.caption(
-    "This build is optimized for Streamlit Cloud: it forces the tiny ASR model and accepts WAV input only. "
-    "For heavier classroom use, consider setting a self-hosted LanguageTool endpoint via Secrets."
+    "This version supports multiple Whisper models, word-level timestamps, "
+    "Italian normalization, and improved transcription. Everything remains free."
 )
