@@ -1,11 +1,14 @@
 # ---------------------------------------------------------
-# Italian Speaking Practice (Updated Edition)
+# Italian Speaking Practice — Custom Rules Edition
 # - ASR model selector (tiny/base/small)
+# - Multi-format uploader (WAV/MP3/M4A/OGG/WEBM)
 # - Word-level timestamps + low-confidence highlighting
 # - Italian apostrophe normalization
-# - Improved transcription with temperature fallback
-# - Uploader now accepts WAV/MP3/M4A/OGG/WEBM
-# - Preserves LT + TTS features (free tools only)
+# - Free feedback: LanguageTool (+ public endpoint) + Custom A2–B1 rules
+#   * Plural noun endings (agreement with plural determiners)
+#   * Prepositions with cities, countries/regions (articulated), common places
+#   * Year with seasons (di -> del), "spend time" (speso/spento -> trascorso)
+# - Optional TTS for corrected text
 # ---------------------------------------------------------
 
 import os
@@ -16,6 +19,8 @@ import wave
 import tempfile
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
+import re
+
 import numpy as np
 import streamlit as st
 
@@ -29,7 +34,6 @@ except Exception:
 from faster_whisper import WhisperModel
 import requests
 from gtts import gTTS
-import re
 
 # ---------------------------
 # ---------- Config ----------
@@ -68,6 +72,16 @@ class LTMatch:
     rule_id: str
     sentence: str
     category: str
+
+# For custom rules
+@dataclass
+class Issue:
+    message: str
+    start: int
+    end: int
+    suggestion: str
+    rule_id: str
+    category: str = "Custom"
 
 # ---------------------------
 # -------- Utilities --------
@@ -113,7 +127,7 @@ def normalize_italian_text(text: str) -> str:
         r"\1'\2",
         text
     )
-    # Clean stray spaces
+    # Clean stray spaces and duplicated spaces
     text = text.replace(" ’ ", "’").replace(" ' ", "'")
     text = text.replace(" ’", "’").replace("’ ", "’")
     text = text.replace(" '", "'").replace("' ", "'")
@@ -205,18 +219,8 @@ def call_languagetool(text: str, endpoint: str) -> Dict:
     except requests.RequestException:
         return {"ok": False, "rate_limited": False, "data": {}}
 
-@dataclass
-class LTMatch:
-    message: str
-    offset: int
-    length: int
-    replacements: List[str]
-    rule_id: str
-    sentence: str
-    category: str
-
 def parse_lt_matches(data: Dict) -> List[LTMatch]:
-    out = []
+    out: List[LTMatch] = []
     for m in data.get("matches", []):
         rule = m.get("rule") or {}
         cat = (rule.get("category") or {}).get("id", "")
@@ -278,6 +282,303 @@ def tts_bytes(text: str) -> io.BytesIO:
     return buf
 
 # ---------------------------
+# ---- Custom Rules (A2–B1) --
+# ---------------------------
+
+TOKEN_RE = re.compile(r"\b[\wàèéìòóùÀÈÉÌÒÓÙ]+\b", re.UNICODE)
+
+# 1) Year with seasons: "... estate di 2024" -> "... estate del 2024"
+SEASON_YEAR_PAT = re.compile(
+    r"\b(estat[ea]|invern[oa]|primaver[ae]|autunn[oa])\s+di\s+(20\d{2})\b",
+    re.IGNORECASE
+)
+
+# 2) Spend time: "ho speso/spento X settimane" -> "ho trascorso X settimane"
+SPEND_TIME_PAT = re.compile(
+    r"\b(ho|hai|ha|abbiamo|avete|hanno)\s+(?:spes\w+|spento)\s+((?:\w+\s+){0,2}?(?:giorno|giorni|settimana|settimane|mese|mesi|anno|anni))\b",
+    re.IGNORECASE
+)
+
+def year_preposition_issues(text: str) -> List[Issue]:
+    issues: List[Issue] = []
+    for m in SEASON_YEAR_PAT.finditer(text):
+        start, end = m.start(), m.end()
+        repl = f"{m.group(1)} del {m.group(2)}"
+        issues.append(Issue(
+            message="Usa 'del' davanti all'anno in questo contesto (non 'di').",
+            start=start, end=end, suggestion=repl,
+            rule_id="IT_YEAR_PREP"
+        ))
+    return issues
+
+def spend_time_issues(text: str) -> List[Issue]:
+    issues: List[Issue] = []
+    for m in SPEND_TIME_PAT.finditer(text):
+        start, end = m.start(), m.end()
+        aux, duration = m.group(1), m.group(2)
+        repl = f"{aux} trascorso {duration}"
+        issues.append(Issue(
+            message="Per il tempo si usa 'trascorrere' (o 'passare'), non 'spendere'.",
+            start=start, end=end, suggestion=repl,
+            rule_id="IT_SPEND_TIME"
+        ))
+    return issues
+
+# 3) Countries/Regions canonical forms (articulated prepositions)
+COUNTRY_FORMS = {
+    "Italia": "in Italia",
+    "Francia": "in Francia",
+    "Spagna": "in Spagna",
+    "Germania": "in Germania",
+    "Svizzera": "in Svizzera",
+    "Austria": "in Austria",
+    "Grecia": "in Grecia",
+    "Portogallo": "in Portogallo",
+    "Regno Unito": "nel Regno Unito",
+    "Inghilterra": "in Inghilterra",
+    "Scozia": "in Scozia",
+    "Irlanda": "in Irlanda",
+    "Stati Uniti": "negli Stati Uniti",
+    "USA": "negli Stati Uniti",
+    "Paesi Bassi": "nei Paesi Bassi",
+    "Olanda": "nei Paesi Bassi",
+    "Cina": "in Cina",
+    "Giappone": "in Giappone",
+    "Corea": "in Corea",
+    "India": "in India",
+    "Australia": "in Australia",
+    "Canada": "in Canada",
+    "Messico": "in Messico",
+    "Brasile": "in Brasile",
+    "Marocco": "in Marocco",
+    "Egitto": "in Egitto",
+    "Turchia": "in Turchia",
+    "Sicilia": "in Sicilia",
+    "Sardegna": "in Sardegna",
+    "Toscana": "in Toscana",
+    "Lombardia": "in Lombardia",
+}
+
+# 4) Common places/buildings canonical forms
+PLACE_FORMS = {
+    "scuola": "a scuola",
+    "casa": "a casa",
+    "lavoro": "al lavoro",
+    "ristorante": "al ristorante",
+    "bar": "al bar",
+    "supermercato": "al supermercato",
+    "parco": "al parco",
+    "università": "all'università",
+    "stadio": "allo stadio",
+    "stazione": "alla stazione",
+    "fermata": "alla fermata",
+    "festa": "alla festa",
+    "aeroporto": "all'aeroporto",
+    "biblioteca": "in biblioteca",
+    "palestra": "in palestra",
+    "farmacia": "in farmacia",
+    "banca": "in banca",
+    "spiaggia": "in spiaggia",
+    "montagna": "in montagna",
+    "campagna": "in campagna",
+    "centro": "in centro",
+    "ufficio": "in ufficio",
+    "chiesa": "in chiesa",
+}
+
+# 5) City rule (simple): "in Roma/Milano/Firenze" -> "a Roma/..."
+#    We will skip this if the location matches one of the COUNTRY_FORMS keys (avoid conflicts).
+CITY_IN_PAT = re.compile(r"\bin\s+([A-ZÀ-Ý][a-zà-ÿ]+)\b")
+
+PREP_VARIANTS = r"(?:a|in|al|allo|alla|all'|all’|nel|nello|nella|nell'|nell’|nei|negli|nelle)"
+
+def keep_title_case(suggestion: str, original_token: str) -> str:
+    if original_token and original_token[0].isupper():
+        # Capitalize only the token part (last word)
+        parts = suggestion.split()
+        if parts:
+            parts[-1] = parts[-1].capitalize()
+            return " ".join(parts)
+    return suggestion
+
+def location_preposition_issues(text: str) -> List[Issue]:
+    issues: List[Issue] = []
+
+    lower_text = text.lower()
+
+    # 5a) Countries/regions: wrong preposition before a known name
+    for name, canonical in COUNTRY_FORMS.items():
+        # Build pattern: any preposition variant + optional articles before the name
+        # Handle multi-word names (e.g., "Stati Uniti", "Regno Unito")
+        name_pat = re.escape(name)
+        pat = re.compile(rf"\b{PREP_VARIANTS}\s+{name_pat}\b", re.IGNORECASE)
+        for m in pat.finditer(text):
+            span = text[m.start():m.end()]
+            # If it's already canonical, skip
+            if span.lower() == canonical.lower():
+                continue
+            # Suggest canonical form, preserving capitalization of the location head word
+            suggestion = canonical
+            # Preserve capitalization of the last word of the name
+            last_word = name.split()[-1]
+            suggestion = keep_title_case(suggestion, last_word)
+            issues.append(Issue(
+                message=f"Con paesi/regioni usa ‘{canonical.split()[0]}’ (forma articolata se richiesta).",
+                start=m.start(), end=m.end(),
+                suggestion=suggestion,
+                rule_id="IT_LOC_COUNTRY"
+            ))
+
+        # Also catch bare "a Italia" or "alla Italia" not covered by PREP_VARIANTS variants
+        # (mostly redundant, but harmless)
+
+    # 5b) Common places/buildings: enforce canonical mapping
+    for noun, canonical in PLACE_FORMS.items():
+        # Match any preposition + (optional article) + noun (with or without article/apostrophe)
+        noun_pat = r"(?:l'|lo|la|il|i|gli|le)?\s*" + re.escape(noun)
+        pat = re.compile(rf"\b{PREP_VARIANTS}\s+{noun_pat}\b", re.IGNORECASE)
+        for m in pat.finditer(text):
+            span = text[m.start():m.end()]
+            if span.lower() == canonical.lower():
+                continue
+            # Preserve capitalization if noun is capitalized in text
+            # (rare for common places, but just in case)
+            original_tail = text[m.start():m.end()].split()[-1]
+            suggestion = canonical
+            suggestion = keep_title_case(suggestion, original_tail)
+            issues.append(Issue(
+                message="Preposizione fissa con il luogo (usa la forma più naturale).",
+                start=m.start(), end=m.end(),
+                suggestion=suggestion,
+                rule_id="IT_LOC_PLACE"
+            ))
+
+    # 5c) Cities: "in X" -> "a X" if X not in country/region list
+    country_heads = {k.split()[-1] for k in COUNTRY_FORMS.keys()}
+    for m in CITY_IN_PAT.finditer(text):
+        city = m.group(1)
+        # Skip if this looks like a country/region head (e.g., "Italia")
+        if city in country_heads or city in COUNTRY_FORMS:
+            continue
+        suggestion = f"a {city}"
+        issues.append(Issue(
+            message="Con le città usa ‘a’, non ‘in’.",
+            start=m.start(), end=m.end(),
+            suggestion=suggestion,
+            rule_id="IT_LOC_CITY"
+        ))
+
+    return issues
+
+# 6) Plural noun endings with plural determiners
+PLURAL_DETS = {
+    "i", "gli", "le",
+    "dei", "degli", "delle",
+    "quei", "quegli", "quelle",
+    "questi", "queste",
+    "alcuni", "alcune",
+    "molti", "molte",
+    "tanti", "tante",
+}
+
+INVARIABLE = {
+    "città", "università", "foto", "auto", "cinema", "computer", "bar"
+}
+
+LEX_EXCEPTIONS = {
+    # masculine in -a class and typical exceptions:
+    "amico": "amici",
+    "greco": "greci",
+    "medico": "medici",
+    "psicologo": "psicologi",
+    "biologo": "biologi",
+    "teologo": "teologi",
+    "catalogo": "cataloghi",
+    "dialogo": "dialoghi",
+    "lago": "laghi",
+    "mano": "mani",
+    "problema": "problemi",
+    "programma": "programmi",
+    "schema": "schemi",
+    "tema": "temi",
+    "poeta": "poeti",
+}
+
+def is_all_lower_or_title(word: str) -> bool:
+    # Allow lowercase or Title Case; skip ALL-CAPS (likely acronyms)
+    return not word.isupper()
+
+def regular_plural_candidate(sg: str) -> str:
+    if sg in LEX_EXCEPTIONS:
+        return LEX_EXCEPTIONS[sg]
+    if sg in INVARIABLE:
+        return sg
+    if sg.endswith("o"):
+        return sg[:-1] + "i"
+    if sg.endswith("a"):
+        return sg[:-1] + "e"
+    if sg.endswith("e"):
+        return sg[:-1] + "i"
+    return sg
+
+def plural_noun_issues(text: str) -> List[Issue]:
+    issues: List[Issue] = []
+    tokens = [(m.group(0), m.start(), m.end()) for m in TOKEN_RE.finditer(text)]
+    for idx, (tok, t_start, t_end) in enumerate(tokens[:-1]):
+        det = tok.lower()
+        if det not in PLURAL_DETS:
+            continue
+        next_tok, n_start, n_end = tokens[idx + 1]
+        noun = next_tok
+        if len(noun) <= 2:
+            continue
+        if not is_all_lower_or_title(noun):
+            continue
+        lower = noun.lower()
+        if lower in INVARIABLE:
+            continue
+        if lower.endswith(("o", "a", "e")):
+            plural_guess = regular_plural_candidate(lower)
+            if plural_guess != lower:
+                if noun[0].isupper():
+                    plural_suggestion = plural_guess.capitalize()
+                else:
+                    plural_suggestion = plural_guess
+                msg = ("Con i determinanti plurali usa il sostantivo al plurale "
+                       f"(qui: “{noun}” → “{plural_suggestion}”).")
+                issues.append(Issue(
+                    message=msg,
+                    start=n_start, end=n_end,
+                    suggestion=plural_suggestion,
+                    rule_id="IT_PLURAL_ENDING"
+                ))
+    return issues
+
+def custom_check(text: str) -> List[Issue]:
+    issues: List[Issue] = []
+    issues.extend(year_preposition_issues(text))
+    issues.extend(spend_time_issues(text))
+    issues.extend(location_preposition_issues(text))
+    issues.extend(plural_noun_issues(text))
+
+    # De-duplicate overlapping issues by (span, rule, suggestion)
+    dedup = []
+    seen = set()
+    for iss in issues:
+        key = (iss.start, iss.end, iss.rule_id, iss.suggestion)
+        if key not in seen:
+            seen.add(key)
+            dedup.append(iss)
+    return dedup
+
+def apply_issues(text: str, issues: List[Issue]) -> str:
+    out = text
+    for iss in sorted(issues, key=lambda x: x.start, reverse=True):
+        if 0 <= iss.start <= len(out) and 0 <= iss.end <= len(out):
+            out = out[:iss.start] + iss.suggestion + out[iss.end:]
+    return out
+
+# ---------------------------
 # ---- Session debounce -----
 # ---------------------------
 
@@ -291,12 +592,12 @@ LT_MIN_INTERVAL_SEC = 2.0
 # ---------------------------
 
 st.set_page_config(
-    page_title="Italian Speaking Practice — Updated",
+    page_title="Italian Speaking Practice — Custom Rules",
     page_icon="🇮🇹",
     layout="wide"
 )
 
-st.title("🇮🇹 Italian Speaking Practice — Updated Edition")
+st.title("🇮🇹 Italian Speaking Practice — Custom Rules Edition")
 
 # Sidebar
 with st.sidebar:
@@ -354,7 +655,7 @@ with col1:
     uploaded = st.file_uploader("…or upload an audio file", type=accepted_types)
 
     audio_path = None
-    input_duration = 0.0  # only reliable for WAV; for others we'll compute from segments
+    input_duration = 0.0  # header-based for WAV; otherwise derive from segments
 
     # Recorder path (always WAV)
     if wav_bytes:
@@ -366,14 +667,11 @@ with col1:
     # Uploaded file path (keep original suffix)
     elif uploaded:
         file_bytes = uploaded.read()
-        # Determine suffix from filename (fallback to .wav if missing)
         suffix = os.path.splitext(uploaded.name)[1].lower() or ".wav"
-        # Safety: restrict to accepted suffixes even if the extension is odd
         if suffix.lstrip(".") not in accepted_types:
             st.error("Unsupported file type. Please upload WAV, MP3, M4A, OGG, or WEBM.")
             st.stop()
         audio_path = save_bytes_to_file(file_bytes, suffix)
-        # Only compute header-based duration for WAV; others computed after transcription.
         if suffix == ".wav":
             input_duration = wav_duration_seconds(audio_path)
             st.success(f"Audio uploaded ({input_duration:.1f}s).")
@@ -432,7 +730,7 @@ with col1:
                 mime="application/json",
             )
 
-        # --- Grammar analysis (LanguageTool) ---
+        # --- Grammar analysis (LanguageTool + Custom) ---
         word_count = len([w for w in text.split() if w.strip()])
         should_call_lt = word_count >= 5
 
@@ -445,6 +743,9 @@ with col1:
         lt_result = {"ok": False, "rate_limited": False, "data": {}}
         matches: List[LTMatch] = []
 
+        # Custom rules (always available, run locally)
+        custom_issues = custom_check(text)
+
         with st.spinner("Analyzing grammar…"):
             if should_call_lt:
                 lt_result = call_languagetool(text, lt_endpoint)
@@ -455,24 +756,36 @@ with col1:
 
         st.markdown("### ✍️ Issues & suggestions")
 
+        # Custom issues first
+        if custom_issues:
+            for i, iss in enumerate(custom_issues, 1):
+                with st.expander(f"[Custom] #{i} {iss.message}"):
+                    bad_span = text[iss.start:iss.end]
+                    st.write(f"**Span:** `{screenshot_safe(bad_span)}`")
+                    st.write(f"**Suggestion:** `{screenshot_safe(iss.suggestion)}`")
+                    st.write(f"Rule: `{iss.rule_id}` • Category: `Custom`")
+
+        # LanguageTool issues next
         if lt_result.get("rate_limited"):
             st.warning("LanguageTool public API limit reached. Try again soon.")
-        elif not should_call_lt:
+        elif not should_call_lt and not custom_issues:
             if word_count < 5:
                 st.info("Speak a bit more to get grammar/style feedback (≥ 5 words).")
             else:
                 st.info("Analyzing… please try again in a moment.")
-        elif not matches:
+        elif not matches and not custom_issues:
             st.info("No significant grammar/style issues found.")
         else:
             for i, m in enumerate(matches, 1):
                 suggestion = m.replacements[0] if m.replacements else "—"
-                with st.expander(f"#{i} {m.message}"):
+                with st.expander(f"[LT] #{i} {m.message}"):
                     st.write(f"**Sentence:** {m.sentence}")
                     st.write(f"**Suggestion:** `{screenshot_safe(suggestion)}`")
                     st.write(f"Rule: `{m.rule_id}` • Category: `{m.category}`")
 
+        # Apply both corrections to produce the corrected version
         corrected = normalize_italian_text(apply_corrections(text, matches))
+        corrected = normalize_italian_text(apply_issues(corrected, custom_issues))
 
         st.markdown("### ✅ Corrected version")
         st.write(corrected)
@@ -512,6 +825,6 @@ with col1:
 
 st.markdown("---")
 st.caption(
-    "Uploader accepts WAV/MP3/M4A/OGG/WEBM. Duration is from WAV header when available; "
-    "otherwise estimated from transcription timing."
+    "Custom rules cover: plurals with plural determiners; prepositions for cities, countries/regions, and common places; "
+    "season+year (‘del 2024’); and ‘trascorrere’ for time spent. You can extend exceptions and whitelists as needed."
 )
