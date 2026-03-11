@@ -4,4 +4,4 @@ faster-whisper==1.0.3
 numpy
 requests
 gTTS
-jiwer==3.0.3
+anthropic>=0.25.0
