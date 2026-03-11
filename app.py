@@ -1,11 +1,12 @@
 # ---------------------------------------------------------
-# Italian Speaking Practice — Claude Sonnet Edition (Optimized)
+# Italian Speaking Practice — Claude Sonnet Edition (Optimized + Warm-Up)
 # - Single provider: Anthropic Claude Sonnet (no LanguageTool/OpenAI)
 # - Token optimizations: compact prompt & JSON, output caps, cleanup
-# - 60s limit: recordings >60s rejected; uploads truncated to 60s for analysis
+# - 60s limit: recordings >60s rejected; uploads truncated to 60s
 # - Multi-format uploader (WAV/MP3/M4A/OGG/WEBM)
 # - Word timestamps + low-confidence highlighting (ASR: faster-whisper)
 # - Optional TTS for corrected text (gTTS, Italian)
+# - NEW: Warm-up button + explicit ASR download status (for Whisper 'small')
 # ---------------------------------------------------------
 
 import os
@@ -20,9 +21,8 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import streamlit as st
-from faster_whisper import WhisperModel
 from gtts import gTTS
-import requests  # only used for mic/uploader fallback if needed
+import requests  # only used for network checks/fallbacks if needed
 
 # Anthropic (Claude) SDK
 try:
@@ -30,13 +30,20 @@ try:
 except ImportError:
     Anthropic = None
 
+# ASR
+from faster_whisper import WhisperModel
+
 # ---------------------------
 # ---------- Config ----------
 # ---------------------------
 
-MAX_RECORD_SECONDS = 60.0  # hard limit for recordings
-TRUNCATE_UPLOAD_SECONDS = 60.0  # analyze only the first 60s from uploads
-DEFAULT_SONNET_MODEL = "claude-3-5-sonnet-latest"  # change if your tenant exposes a newer snapshot
+MAX_RECORD_SECONDS = 60.0           # hard limit for recordings
+TRUNCATE_UPLOAD_SECONDS = 60.0      # analyze only the first 60s for uploads
+DEFAULT_SONNET_MODEL = "claude-3-5-sonnet-latest"
+
+# Default ASR model & compute (keep accuracy with "small"; int8 for CPU speed)
+DEFAULT_ASR_MODEL = "small"
+DEFAULT_COMPUTE = "int8"
 
 PROMPTS = [
     "Describe your ideal day from start to finish.",
@@ -56,7 +63,7 @@ RUBRIC_HINT = "A2–B1 orale: correzioni essenziali, spiegazioni brevi, tono inc
 
 @dataclass
 class Issue:
-    msg: str
+    message: str
     start: int
     end: int
     suggestion: str
@@ -72,6 +79,7 @@ def warning_banner():
         "⏱️ **Recording limit**: up to 60 seconds. "
         "Uploads longer than 60s will be **analyzed only for the first 60s**."
     )
+    st.caption("ℹ️ First run on this server may take a few minutes to download the ASR model (Whisper *small*).")
 
 def get_api_key() -> Optional[str]:
     return (st.secrets.get("ANTHROPIC_API_KEY")
@@ -84,6 +92,7 @@ def get_anthropic_client(api_key: str):
 
 @st.cache_resource(show_spinner=False)
 def load_fw_model(name: str, compute: str) -> WhisperModel:
+    # first time with 'small' can trigger a ~244MB download; faster-whisper caches it per container
     return WhisperModel(name, device="cpu", compute_type=compute)
 
 def wav_duration_seconds(path: str) -> float:
@@ -107,7 +116,6 @@ MULTISPACE = re.compile(r"\s{2,}")
 FILLERS = {"ehm", "eh", "mmm", "uh", "cioè", "tipo", "diciamo", "boh", "praticamente"}
 
 def normalize_italian_text(text: str) -> str:
-    # merge l ' amico -> l'amico, and cleanup apostrophes/whitespace
     t = re.sub(r"\b([lLdDaAeEoOuU]l?)\s*'\s*([a-zA-Zàèéìòóù])", r"\1'\2", text)
     t = t.replace(" ’ ", "’").replace(" ' ", "'")
     t = t.replace(" ’", "’").replace("’ ", "’")
@@ -126,7 +134,6 @@ def remove_fillers_tokens(text: str) -> str:
     return " ".join(kept)
 
 def dedupe_repetitions(text: str) -> str:
-    # remove exact adjacent repetition of short phrases (simple heuristic)
     parts = text.split()
     out = []
     for w in parts:
@@ -139,7 +146,6 @@ def compact_for_llm(text: str, remove_fillers: bool = True, max_words: int = 180
     if remove_fillers:
         t = remove_fillers_tokens(t)
     t = dedupe_repetitions(t)
-    # cap by words (rough token proxy)
     words = t.split()
     if len(words) > max_words:
         words = words[:max_words]
@@ -151,10 +157,11 @@ def compact_for_llm(text: str, remove_fillers: bool = True, max_words: int = 180
 
 def transcribe(model: WhisperModel, audio_path: str):
     """
-    Transcribe Italian with word timestamps.
-    Returns: (full_text, words, seg_stats)
+    Transcribe Italian audio with word timestamps.
+    Returns (full_text, words, seg_stats).
     """
     temperature = [0.0, 0.2, 0.4]
+
     segments, _ = model.transcribe(
         audio_path,
         language="it",
@@ -167,8 +174,10 @@ def transcribe(model: WhisperModel, audio_path: str):
         compression_ratio_threshold=2.4,
         log_prob_threshold=-1.0,
         no_speech_threshold=0.6,
-        initial_prompt=("Trascrivi in italiano standard senza riformulare. "
-                        "Evita correzioni non necessarie. Non tradurre."),
+        initial_prompt=(
+            "Trascrivi in italiano standard senza riformulare. "
+            "Evita correzioni non necessarie. Non tradurre."
+        ),
         condition_on_previous_text=False,
         word_timestamps=True,
         without_timestamps=False
@@ -214,7 +223,6 @@ def words_to_text(words: List[Dict]) -> str:
 # ---------------------------
 
 def build_compact_prompt(level_hint: str) -> str:
-    # Minimal, reusable system-style content
     return (
         "Sei un correttore per studenti di italiano (A2–B1). "
         "Correggi solo errori chiari e frequenti, senza riscrivere troppo. "
@@ -223,7 +231,6 @@ def build_compact_prompt(level_hint: str) -> str:
     )
 
 def build_user_instruction(level_hint: str) -> str:
-    # Compact schema with constraints to shrink output tokens
     return (
         "Fornisci SOLO JSON compatto con questa struttura e nulla di più:\n"
         "{\n"
@@ -256,12 +263,7 @@ def feedback_claude_sonnet(
     system_msg = build_compact_prompt(level_hint)
     user_schema = build_user_instruction(level_hint)
 
-    # Compose a single user message with schema + text to reduce overhead
-    user_content = (
-        user_schema
-        + "\n\nTESTO DA ANALIZZARE (italiano):\n"
-        + text_it
-    )
+    user_content = user_schema + "\n\nTESTO DA ANALIZZARE (italiano):\n" + text_it
 
     resp = client.messages.create(
         model=model,
@@ -273,24 +275,20 @@ def feedback_claude_sonnet(
 
     txt = ""
     try:
-        # SDK returns a list of content blocks; first is text
         txt = (resp.content[0].text if resp.content else "").strip()
     except Exception:
         txt = ""
 
     parsed = {"c": "", "i": []}
     try:
-        # Some models may prepend stray characters; find first '{'
         start = txt.find("{")
         if start > 0:
             txt = txt[start:]
         parsed = json.loads(txt)
         if not isinstance(parsed, dict):
             parsed = {"c": "", "i": []}
-        # ensure keys exist
         parsed.setdefault("c", "")
         parsed.setdefault("i", [])
-        # enforce caps locally
         if isinstance(parsed["i"], list) and len(parsed["i"]) > 4:
             parsed["i"] = parsed["i"][:4]
     except Exception:
@@ -298,8 +296,7 @@ def feedback_claude_sonnet(
 
     in_tok = getattr(resp.usage, "input_tokens", 0)
     out_tok = getattr(resp.usage, "output_tokens", 0)
-    # Pricing: Sonnet ≈ $3/M input, $15/M output
-    cost = in_tok * 3e-6 + out_tok * 15e-6
+    cost = in_tok * 3e-6 + out_tok * 15e-6  # Sonnet: ~$3/M input, ~$15/M output
 
     usage = {"input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost}
     return parsed, usage
@@ -314,7 +311,7 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🇮🇹 Italian Speaking Practice — Claude Sonnet (Optimized)")
+st.title("🇮🇹 Italian Speaking Practice — Claude Sonnet (Optimized + Warm-Up)")
 warning_banner()
 
 with st.sidebar:
@@ -325,17 +322,28 @@ with st.sidebar:
     if not api_key:
         st.warning("Add **ANTHROPIC_API_KEY** to Streamlit Secrets or environment variables.")
 
-    # Claude model (allow override)
+    # Claude model
     model_name = st.text_input(
         "Claude model",
         value=DEFAULT_SONNET_MODEL,
         help="Default Sonnet model. Change if your tenant exposes a newer snapshot."
     )
 
-    # ASR settings
+    # ASR settings (default to 'small' for accuracy; int8 for CPU)
     st.subheader("ASR (Whisper)")
     whisper_model = st.selectbox("Model size", ["small", "base", "tiny"], index=0)
-    compute_type = st.selectbox("Compute type", ["int8_float16", "int8", "float16"], index=0)
+    compute_type = st.selectbox("Compute type", ["int8", "int8_float16", "float16"], index=0)
+    # Warm-up button to fetch model before first analysis
+    if st.button("🔧 Warm up ASR model now"):
+        with st.status("Preparing ASR…", expanded=True) as status:
+            st.write("🔄 Checking Whisper model cache…")
+            st.write("📥 First run may download the model (~244 MB for 'small'). This can take a few minutes.")
+            try:
+                _ = load_fw_model(whisper_model, compute_type)
+                status.update(label=f"ASR preloaded: {whisper_model}/{compute_type}", state="complete", expanded=False)
+                st.success("ASR model warmed up.")
+            except Exception as e:
+                st.error(f"ASR loading error: {e}")
 
     # Optimization toggles
     st.subheader("Token optimization")
@@ -365,7 +373,7 @@ with col1:
     audio_path = None
     input_duration = 0.0
 
-    # --- Microphone (WAV) ---
+    # Recorder (WAV)
     MIC_AVAILABLE = False
     try:
         from streamlit_mic_recorder import mic_recorder
@@ -387,11 +395,11 @@ with col1:
             elif isinstance(rec, (bytes, bytearray)):
                 wav_bytes = bytes(rec)
 
-    # --- Uploader (multi-format) ---
+    # Uploader
     accepted_types = ["wav", "mp3", "m4a", "ogg", "webm"]
     uploaded = st.file_uploader("…or upload an audio file", type=accepted_types)
 
-    # Handle recording (always WAV)
+    # Handle recording
     if wav_bytes:
         audio_path = save_bytes_to_file(wav_bytes, ".wav")
         input_duration = wav_duration_seconds(audio_path)
@@ -404,7 +412,7 @@ with col1:
             st.success(f"Recording captured ({input_duration:.1f}s).")
             st.audio(wav_bytes, format="audio/wav")
 
-    # Handle upload (keep original suffix). We’ll analyze only first 60s.
+    # Handle upload
     elif uploaded:
         file_bytes = uploaded.read()
         suffix = os.path.splitext(uploaded.name)[1].lower() or ".wav"
@@ -421,7 +429,7 @@ with col1:
 
     # ---- Analyze ----
     if st.button("🧠 Analyze") and audio_path:
-        # Check API key and client
+        # Sanity checks
         if Anthropic is None:
             st.error("The 'anthropic' package is not installed. Please add it to requirements.txt.")
             st.stop()
@@ -429,11 +437,14 @@ with col1:
             st.error("ANTHROPIC_API_KEY is missing. Add it to Streamlit Secrets or environment variables.")
             st.stop()
 
-        # Load ASR model
-        with st.status("Loading ASR model…", expanded=False) as status:
+        # Load ASR model with explicit status for first-time download
+        with st.status("Preparing ASR…", expanded=True) as status:
+            st.write("🔄 Checking Whisper model cache…")
+            st.write("📥 If this is the first run, the model is being downloaded (~244 MB for 'small').")
+            st.write("💡 Tip: the Warm-Up button can preload the model before class.")
             try:
                 asr_model = load_fw_model(whisper_model, compute_type)
-                status.update(label=f"Model ready: {whisper_model}/{compute_type}", state="complete", expanded=False)
+                status.update(label=f"ASR ready: {whisper_model}/{compute_type}", state="complete", expanded=False)
             except Exception as e:
                 st.error(f"ASR loading error: {e}")
                 st.stop()
@@ -446,13 +457,10 @@ with col1:
                 st.error(f"Transcription error: {e}")
                 st.stop()
 
-        # If this is an upload, analyze only first 60 seconds (truncate words)
+        # Truncate uploads to first 60s
         if uploaded and words:
             words_60 = truncate_words_to_seconds(words, TRUNCATE_UPLOAD_SECONDS)
-            if words_60:
-                text_60 = words_to_text(words_60)
-            else:
-                text_60 = raw_text
+            text_60 = words_to_text(words_60) if words_60 else raw_text
         else:
             text_60 = raw_text
 
@@ -476,86 +484,4 @@ with col1:
                 for w in words_list:
                     dur = (w["end"] - w["start"]) if w["end"] > w["start"] else 0.0
                     low_conf = (w["conf"] < 0.30) or (dur < 0.06)
-                    if low_conf and w["end"] <= (TRUNCATE_UPLOAD_SECONDS if uploaded else MAX_RECORD_SECONDS):
-                        spans.append(
-                            f"<span style='background:#fff3cd;padding:2px 4px;border-radius:4px'>{w['word']}</span>"
-                        )
-                    else:
-                        spans.append(w["word"])
-                return " ".join(spans)
-
-            st.markdown("#### 🔎 Low‑confidence words (highlighted)")
-            st.markdown(render_word_spans(words), unsafe_allow_html=True)
-
-        # Claude Sonnet call
-        client = get_anthropic_client(api_key)
-        with st.spinner("Generating feedback…"):
-            try:
-                parsed, usage = feedback_claude_sonnet(
-                    client=client,
-                    model=model_name,
-                    text_it=compact_text,
-                    level_hint=RUBRIC_HINT,
-                    max_output_tokens=400 if compact_mode else 700
-                )
-            except Exception as e:
-                st.error(f"Claude error: {e}")
-                st.stop()
-
-        # Render feedback
-        st.markdown("### ✍️ Issues & suggestions (Claude Sonnet)")
-        issues = parsed.get("i", []) if isinstance(parsed, dict) else []
-        if not issues:
-            st.info("Nessun errore significativo trovato.")
-        else:
-            for idx, it in enumerate(issues, 1):
-                s = it.get("s", "")
-                f = it.get("f", "")
-                e = it.get("e", "")
-                with st.expander(f"#{idx} {e or 'Suggerimento'}"):
-                    st.write(f"**Span:** `{s}`")
-                    st.write(f"**Suggerimento:** `{f}`")
-                    if e:
-                        st.caption(e)
-
-        corrected = parsed.get("c", "").strip() if isinstance(parsed, dict) else ""
-        st.markdown("### ✅ Corrected version")
-        st.write(corrected if corrected else "(—)")
-
-        if auto_tts and corrected:
-            try:
-                buf = io.BytesIO()
-                gTTS(corrected, lang="it").write_to_fp(buf)
-                buf.seek(0)
-                st.audio(buf, format="audio/mp3")
-                st.download_button(
-                    "⬇️ Download audio (MP3)",
-                    data=buf,
-                    file_name="correction.mp3",
-                    mime="audio/mpeg"
-                )
-            except Exception as e:
-                st.warning(f"TTS unavailable: {e}")
-
-        # Indicators & cost
-        n_words = len([w for w in compact_text.split() if w.strip()])
-        duration_sec = (
-            seg_stats[-1]["end"] if seg_stats else 0.0
-        )
-        wpm = round(n_words / (max(duration_sec, 1e-6) / 60), 1) if duration_sec else 0.0
-
-        st.markdown("### 💰 Usage & indicators")
-        cA, cB, cC = st.columns(3)
-        cA.metric("Input tokens", usage.get("input_tokens", 0))
-        cA.metric("Output tokens", usage.get("output_tokens", 0))
-        cB.metric("Estimated cost ($)", round(usage.get("cost_usd", 0.0), 5))
-        cB.metric("Words sent", n_words)
-        cC.metric("Approx. WPM (transcribed)", wpm)
-        cC.metric("Max analyzed seconds",
-                  int(TRUNCATE_UPLOAD_SECONDS if uploaded else MAX_RECORD_SECONDS))
-
-st.markdown("---")
-st.caption(
-    "Feedback powered by Claude Sonnet (API). Pricing reference: ~$3/M input tokens & $15/M output tokens. "
-    "Only the first 60s of uploaded audio are analyzed; recordings >60s are rejected."
-)
+                    # only highlight words within analyzed window
