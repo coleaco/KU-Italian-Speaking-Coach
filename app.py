@@ -196,3 +196,9 @@ def transcribe(model: WhisperModel, audio_path: str):
         seg_stats.append({
             "start": float(getattr(s, "start", 0.0) or 0.0),
             "end": float(getattr(s, "end", 0.0) or 0.0),
+        "avg_logprob": float(getattr(s, "avg_logprob", -5.0)),
+            "no_speech_prob": float(getattr(s, "no_speech_prob", 0.0)),
+        })
+
+    full_text = " ".join(texts).strip()
+    return full_text, words, seg_stats
