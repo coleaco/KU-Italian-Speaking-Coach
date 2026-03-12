@@ -39,7 +39,7 @@ from faster_whisper import WhisperModel
 # ---------------------------
 MAX_RECORD_SECONDS = 60.0  # hard limit for recordings
 TRUNCATE_UPLOAD_SECONDS = 60.0  # analyze only the first 60s for uploads
-DEFAULT_SONNET_MODEL = "claude-3-5-sonnet-latest"  # you can change in the sidebar
+DEFAULT_SONNET_MODEL = "claude-sonnet-4-6"  # you can change in the sidebar
 # Default ASR model & compute (keep accuracy with "small"; int8 for CPU speed)
 DEFAULT_ASR_MODEL = "small"
 DEFAULT_COMPUTE = "int8"
